@@ -6,17 +6,17 @@
 # LICENSE file in the root directory of this source tree.
 
 import asyncio
-from typing import Any, AsyncGenerator, Callable, Generic, Optional, Type, TypeVar, Union
+from typing import Any, AsyncGenerator, Callable, Optional, Type, Union
 
+from megatron.core.inference.inference_request import InferenceRequest
 from megatron.core.utils import get_asyncio_loop
 
 STOP_ITERATION = Exception()
-T = TypeVar("T")
 
 
-class AsyncStream(Generic[T]):
+class AsyncStream:
     """
-    Class for encapsulating an asynchronous stream of request outputs.
+    Class for encapsulating an asynchronous stream of InferenceRequest outputs.
 
     Adopted from https://github.com/vllm-project/vllm/blob/eb881ed006ca458b052905e33f0d16dbb428063a/vllm/v1/engine/async_stream.py # pylint: disable=line-too-long
     """
@@ -24,7 +24,7 @@ class AsyncStream(Generic[T]):
     def __init__(
         self,
         request_id: int,
-        cancel: Callable[[], None],
+        cancel: Callable[[str], None],
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
         self._request_id = request_id
@@ -33,12 +33,7 @@ class AsyncStream(Generic[T]):
         self._finished = False
         self._loop = get_asyncio_loop(loop)
 
-    @property
-    def request_id(self) -> int:
-        """The request associated with this stream."""
-        return self._request_id
-
-    def put(self, item: Union[T, Exception]) -> None:
+    def put(self, item: Union[InferenceRequest, Exception]) -> None:
         """Adds a new value to the stream"""
         if not self._finished:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
@@ -57,29 +52,18 @@ class AsyncStream(Generic[T]):
         """Whether the stream has finished"""
         return self._finished
 
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> T:
-        result = await self._queue.get()
-        if self._is_raisable(result):
-            if result == STOP_ITERATION:
-                raise StopAsyncIteration
-            raise result
-        return result
-
-    async def aclose(self) -> None:
-        """Cancel the request if the stream is still active."""
-        if not self._finished:
-            self._cancel()
-
-    async def generator(self) -> AsyncGenerator[T, None]:
+    async def generator(self) -> AsyncGenerator[InferenceRequest, None]:
         """Creates an AsyncGenerator over the stream queue"""
         try:
-            async for result in self:
+            while True:
+                result = await self._queue.get()
+                if self._is_raisable(result):
+                    if result == STOP_ITERATION:
+                        return
+                    raise result
                 yield result
         except GeneratorExit:
-            await self.aclose()
+            self._cancel()
             raise asyncio.CancelledError from None
 
     @staticmethod

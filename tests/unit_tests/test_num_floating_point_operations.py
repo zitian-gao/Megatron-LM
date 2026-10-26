@@ -48,6 +48,8 @@ def _make_gpt_args(
     args.num_attention_heads = num_attention_heads
     args.seq_length = seq_length
     args.padded_vocab_size = padded_vocab_size
+    args.layer_loop_times = 1
+    args.model_loop_times = 1
     args.swiglu = swiglu
     args.ffn_hidden_size = ffn_hidden_size if ffn_hidden_size is not None else 4 * hidden_size
     args.kv_channels = hidden_size // num_attention_heads
@@ -148,6 +150,31 @@ class TestBSHDBackwardCompat:
         )
 
         assert default_flops == explicit_flops
+
+
+class TestLoopScaling:
+    """Layer/model loops scale decoder-layer FLOPs by their product."""
+
+    @pytest.mark.parametrize("model_kind", ["dense", "hybrid"])
+    def test_layer_and_model_loop_multipliers_compose(self, model_kind):
+        def loop_flops(layer_loop_times, model_loop_times):
+            args = _make_hybrid_args() if model_kind == "hybrid" else _make_gpt_args()
+            # Decoder loops do not repeat the final vocabulary projection. Removing it
+            # here isolates the decoder-layer work and makes the expected ratio exact.
+            args.padded_vocab_size = 0
+            args.layer_loop_times = layer_loop_times
+            args.model_loop_times = model_loop_times
+            return num_floating_point_operations(
+                args,
+                batch_size=4,
+                total_real_tokens_in_batch=2048,
+                seqlen_squared_sum_in_batch=4 * 4 * (args.seq_length // 4) ** 2,
+            )
+
+        baseline = loop_flops(1, 1)
+        assert loop_flops(2, 1) == 2 * baseline
+        assert loop_flops(1, 3) == 3 * baseline
+        assert loop_flops(2, 3) == 6 * baseline
 
 
 class TestTHDScaling:

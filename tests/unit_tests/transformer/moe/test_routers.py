@@ -81,6 +81,50 @@ class TestTop2Router:
             scores, indices = self.router(hidden_states)
 
     @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_layer_loop_expert_reuse_cache_reset_and_disable(self):
+        self.router = self.router.cuda()
+        hidden_states = torch.randn(
+            (16, 2, self.router.config.hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+
+        with torch.no_grad():
+            self.router.config.layer_loop_reuse_expert = True
+            self.router.set_model_loop_state(1, 3)
+            self.router.set_layer_loop_state(0, 2)
+            assert self.router._get_loop_metric_suffix() == "_model_loop_2_layer_loop_1"
+            first_probs, first_map = self.router(hidden_states)
+            assert self.router._layer_loop_route_cache[0] is first_probs
+            assert self.router._layer_loop_route_cache[1] is first_map
+
+            # Later loop iterations return the first iteration's routing decision,
+            # even when their hidden states would otherwise route differently.
+            self.router.set_layer_loop_state(1, 2)
+            reused_probs, reused_map = self.router(-hidden_states)
+            assert reused_probs is first_probs
+            assert reused_map is first_map
+            assert self.router._layer_loop_route_cache is None
+
+            # Starting a new layer-loop pass invalidates the previous decision.
+            self.router.set_layer_loop_state(0, 2)
+            assert self.router._layer_loop_route_cache is None
+            refreshed_probs, refreshed_map = self.router(-hidden_states)
+            assert refreshed_probs is not first_probs
+            assert refreshed_map is not first_map
+            assert not torch.equal(refreshed_map, first_map)
+
+            # Disabling reuse leaves the cache empty and recomputes every iteration.
+            self.router.config.layer_loop_reuse_expert = False
+            self.router.set_layer_loop_state(0, 2)
+            disabled_first_probs, disabled_first_map = self.router(hidden_states)
+            assert self.router._layer_loop_route_cache is None
+            self.router.set_layer_loop_state(1, 2)
+            disabled_second_probs, disabled_second_map = self.router(-hidden_states)
+            assert disabled_second_probs is not disabled_first_probs
+            assert disabled_second_map is not disabled_first_map
+            assert not torch.equal(disabled_second_map, disabled_first_map)
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not torch.cuda.is_available() or not HAVE_ROUTER_FUSION,
         reason="TE fused router ops not available",
@@ -462,6 +506,31 @@ class TestAuxLossFreeTop2Router:
 
         # Print some debug info
         print("Updated bias after first forward pass:", updated_bias)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_expert_bias_padding_mask_uses_flat_token_shape(self):
+        self.router = self.router.cuda()
+        self.router.local_tokens_per_expert.zero_()
+        seq_len = 8
+        batch_size = 3
+        hidden_states = torch.randn(
+            (seq_len, batch_size, self.router.config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        padding_mask = torch.zeros((seq_len, batch_size), dtype=torch.bool, device="cuda")
+        padding_mask[-2:, :] = True
+
+        _, routing_map = self.router(hidden_states, padding_mask=padding_mask)
+        valid_routing_map = routing_map & (~padding_mask.reshape(-1)).unsqueeze(-1)
+
+        torch.testing.assert_close(
+            self.router.local_tokens_per_expert, valid_routing_map.sum(dim=0)
+        )
+        assert self.router.local_tokens_per_expert.sum() == (
+            (seq_len - 2) * batch_size * self.router.config.moe_router_topk
+        )
 
     @pytest.mark.internal
     @pytest.mark.skipif(

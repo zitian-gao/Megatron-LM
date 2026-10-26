@@ -397,6 +397,17 @@ def _check_arg_is_not_none(args, arg):
 def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
+    # Keep existing YAML configurations backward compatible with execution-loop fields added to
+    # TransformerConfig. Other missing fields remain errors in core_config_from_args below.
+    for field_name in (
+        "layer_loop_times",
+        "model_loop_times",
+        "layer_loop_reuse_expert",
+        "moe_uelb_group_size",
+        "moe_balance_metrics_in_eval",
+    ):
+        if not hasattr(args, field_name):
+            setattr(args, field_name, getattr(TransformerConfig, field_name))
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
     
@@ -450,4 +461,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

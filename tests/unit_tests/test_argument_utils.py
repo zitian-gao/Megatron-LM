@@ -8,8 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
+from megatron.core.distributed.distributed_data_parallel_config import (
+    DistributedDataParallelConfig,
+)
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
@@ -653,6 +656,62 @@ class TestArgumentGroupFactoryArgparseMeta:
 
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
+
+    def test_loop_and_uelb_cli_defaults_and_overrides(self):
+        """Loop and UELB config fields are exposed with stable CLI defaults."""
+        from megatron.training.arguments import _add_moe_args, _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+        _add_moe_args(parser)
+
+        defaults = parser.parse_args([])
+        assert defaults.layer_loop_times == 1
+        assert defaults.model_loop_times == 1
+        assert defaults.layer_loop_reuse_expert is False
+        assert defaults.moe_uelb_group_size == 2
+        assert defaults.moe_balance_metrics_in_eval is False
+
+        overrides = parser.parse_args(
+            [
+                "--layer-loop-times",
+                "2",
+                "--model-loop-times",
+                "3",
+                "--layer-loop-reuse-expert",
+                "--moe-uelb-group-size",
+                "4",
+                "--moe-balance-metrics-in-eval",
+                "--moe-router-load-balancing-type",
+                "uelb_loss",
+            ]
+        )
+        assert overrides.layer_loop_times == 2
+        assert overrides.model_loop_times == 3
+        assert overrides.layer_loop_reuse_expert is True
+        assert overrides.moe_uelb_group_size == 4
+        assert overrides.moe_balance_metrics_in_eval is True
+        assert overrides.moe_router_load_balancing_type == ["uelb_loss"]
+
+    def test_loop_config_normalization_and_uelb_group_validation(self):
+        """Non-positive loop counts normalize to one; invalid UELB groups fail early."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=1,
+            layer_loop_times=0,
+            model_loop_times=-1,
+        )
+        assert config.layer_loop_times == 1
+        assert config.model_loop_times == 1
+
+        with pytest.raises(ValueError, match="moe_uelb_group_size"):
+            TransformerConfig(
+                num_layers=1,
+                hidden_size=8,
+                num_attention_heads=1,
+                moe_uelb_group_size=0,
+            )
 
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""

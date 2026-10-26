@@ -21,6 +21,7 @@ Usage:
     )
 """
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
@@ -44,6 +45,56 @@ class MetricEntry:
 # Module-level global tracker (follows parallel_state / global_vars pattern)
 # ---------------------------------------------------------------------------
 _MOE_METRICS_TRACKER: Optional['MoEMetricsTracker'] = None
+
+
+ROUTER_LOAD_BALANCING_METRIC_NAMES = ("expert_ratio", "drop_ratio", "maxvio", "avgvio")
+
+
+def _parse_router_load_balancing_metric_name(
+    name: str,
+) -> Optional[tuple[str, Optional[int], Optional[int]]]:
+    """Parse a router metric name and return its model- and layer-loop indices."""
+    for base_name in ROUTER_LOAD_BALANCING_METRIC_NAMES:
+        if name == base_name:
+            return base_name, None, None
+        if not name.startswith(f"{base_name}_"):
+            continue
+
+        suffix = name[len(base_name) :]
+        match = re.fullmatch(r"_model_loop_(\d+)_layer_loop_(\d+)", suffix)
+        if match:
+            return base_name, int(match.group(1)), int(match.group(2))
+
+        match = re.fullmatch(r"_model_loop_(\d+)", suffix)
+        if match:
+            return base_name, int(match.group(1)), None
+
+        match = re.fullmatch(r"_layer_loop_(\d+)", suffix)
+        if match:
+            return base_name, None, int(match.group(1))
+
+    return None
+
+
+def _format_router_load_balancing_metric_name(
+    name: str, *, layer_idx: Optional[int] = None, wandb_section: bool = False
+) -> Optional[str]:
+    """Format router metrics consistently for TensorBoard and Weights & Biases."""
+    parsed_name = _parse_router_load_balancing_metric_name(name)
+    if parsed_name is None:
+        return None
+
+    base_name, model_loop_idx, layer_loop_idx = parsed_name
+    name_parts = [base_name]
+    if layer_idx is not None:
+        name_parts.append(f"layer{layer_idx + 1}")
+    if model_loop_idx is not None:
+        name_parts.append(f"model_loop{model_loop_idx}")
+    if layer_loop_idx is not None:
+        name_parts.append(f"loop{layer_loop_idx}")
+
+    formatted_name = "_".join(name_parts)
+    return f"load_balancing/{formatted_name}" if wandb_section else formatted_name
 
 
 def get_moe_metrics_tracker() -> 'MoEMetricsTracker':
@@ -202,9 +253,17 @@ class MoEMetricsTracker:
                     console_scalars.pop(k)
 
         self._log_scalars(scalars, iteration, writer, wandb_writer)
-        if per_layer_logging:
+        if per_layer_logging or any(
+            _parse_router_load_balancing_metric_name(name) is not None for name in metric_names
+        ):
             self._log_per_layer(
-                loss_scale, metric_names, iteration, writer, wandb_writer, percentiles
+                loss_scale,
+                metric_names,
+                iteration,
+                writer,
+                wandb_writer,
+                percentiles,
+                log_all_metrics=per_layer_logging,
             )
 
         log_string = self._format(console_scalars)
@@ -255,17 +314,12 @@ class MoEMetricsTracker:
         """
         if pg_collection is None:
             pp_group = parallel_state.get_pipeline_model_parallel_group()
-            dp_group = None
-        else:
-            pp_group = pg_collection.pp
-            dp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None)
-        # The metric DP-average must span gtp_remat peers (they hold distinct tokens), else the
-        # displayed value is a 1/gtp_remat subsample and looks noisy. Use the gtp_remat-inclusive
-        # group; CP ranks (already summed in reduce_group) average as a no-op.
-        if dp_group is None:
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
+        else:
+            pp_group = pg_collection.pp
+            dp_group = pg_collection.dp
 
         for name in metric_names:
             if name not in self._metrics:
@@ -349,10 +403,21 @@ class MoEMetricsTracker:
     ) -> None:
         """Write scalar metrics to TensorBoard and/or W&B."""
         for name, value in scalars.items():
+            formatted_router_name = _format_router_load_balancing_metric_name(name)
+            writer_name = (
+                f"moe/load_balancing/{formatted_router_name}"
+                if formatted_router_name is not None
+                else name
+            )
+            wandb_name = (
+                _format_router_load_balancing_metric_name(name, wandb_section=True)
+                if formatted_router_name is not None
+                else name
+            )
             if writer is not None:
-                writer.add_scalar(name, value, iteration)
+                writer.add_scalar(writer_name, value, iteration)
             if wandb_writer is not None:
-                wandb_writer.log({name: value}, iteration)
+                wandb_writer.log({wandb_name: value}, iteration)
 
     def _log_per_layer(
         self,
@@ -362,10 +427,15 @@ class MoEMetricsTracker:
         writer,
         wandb_writer,
         percentiles: Optional[Dict[str, List[float]]] = None,
+        log_all_metrics: bool = True,
     ) -> None:
         """Write per-layer metric values to TensorBoard and/or W&B."""
         for name in metric_names:
             if name not in self._metrics:
+                continue
+
+            is_router_metric = _parse_router_load_balancing_metric_name(name) is not None
+            if not log_all_metrics and not is_router_metric:
                 continue
 
             values = self._metrics[name].values.float() * loss_scale
@@ -373,10 +443,25 @@ class MoEMetricsTracker:
             for i, val in enumerate(values.tolist()):
                 if is_sparse and val == 0:
                     continue
+                formatted_router_name = _format_router_load_balancing_metric_name(
+                    name, layer_idx=i
+                )
+                writer_name = (
+                    f"moe/load_balancing/{formatted_router_name}"
+                    if formatted_router_name is not None
+                    else f"moe/{name}_layer_{i}"
+                )
+                wandb_name = (
+                    _format_router_load_balancing_metric_name(
+                        name, layer_idx=i, wandb_section=True
+                    )
+                    if formatted_router_name is not None
+                    else f"moe/{name}_layer_{i}"
+                )
                 if writer is not None:
-                    writer.add_scalar(f"moe/{name}_layer_{i}", val, iteration)
+                    writer.add_scalar(writer_name, val, iteration)
                 if wandb_writer is not None:
-                    wandb_writer.log({f"moe/{name}_layer_{i}": val}, iteration)
+                    wandb_writer.log({wandb_name: val}, iteration)
 
     @staticmethod
     def _format(scalars: Dict[str, Union[float, torch.Tensor]]) -> str:

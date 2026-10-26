@@ -2,6 +2,7 @@
 
 
 import gc
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,7 +20,10 @@ from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
-from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
+from megatron.core.transformer.cuda_graphs import (
+    CudaGraphManager,
+    _CudagraphGlobalRecord,
+)
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
@@ -28,6 +32,148 @@ from megatron.core.transformer.transformer_layer import (
 )
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class TestTransformerLayerLooping:
+
+    @pytest.mark.parametrize("call_style", ["positional", "keyword"])
+    def test_layer_loop_chains_hidden_state_context_and_forward_arguments(self, call_style):
+        """Each loop consumes the preceding MLP output while preserving attention metadata."""
+
+        class RecordingRouter:
+            def __init__(self):
+                self.states = []
+
+            def set_layer_loop_state(self, loop_idx, layer_loop_times):
+                self.states.append((loop_idx, layer_loop_times))
+
+        router = RecordingRouter()
+        attention_calls = []
+        mlp_calls = []
+
+        attention_mask = object()
+        context_mask = object()
+        rotary_pos_emb = object()
+        rotary_pos_cos = object()
+        rotary_pos_sin = object()
+        rotary_pos_cos_sin = object()
+        attention_bias = object()
+        inference_context = object()
+        packed_seq_params = object()
+        sequence_len_offset = object()
+        padding_mask = object()
+
+        def forward_attention(*args, **kwargs):
+            def argument(position, name):
+                return args[position] if len(args) > position else kwargs.get(name)
+
+            hidden_states = argument(0, "hidden_states")
+            context = argument(2, "context")
+            attention_calls.append(
+                {
+                    "hidden_states": hidden_states.clone(),
+                    "attention_mask": argument(1, "attention_mask"),
+                    "context": context.clone(),
+                    "context_mask": argument(3, "context_mask"),
+                    "rotary_pos_emb": argument(4, "rotary_pos_emb"),
+                    "rotary_pos_cos": argument(5, "rotary_pos_cos"),
+                    "rotary_pos_sin": argument(6, "rotary_pos_sin"),
+                    "rotary_pos_cos_sin": argument(7, "rotary_pos_cos_sin"),
+                    "attention_bias": argument(8, "attention_bias"),
+                    "inference_context": argument(9, "inference_context"),
+                    "packed_seq_params": argument(10, "packed_seq_params"),
+                    "sequence_len_offset": argument(11, "sequence_len_offset"),
+                    "padding_mask": argument(12, "padding_mask"),
+                }
+            )
+            return hidden_states + 1, context + 10
+
+        def forward_mlp(
+            hidden_states, current_inference_context, *, padding_mask, packed_seq_params
+        ):
+            mlp_calls.append(
+                (
+                    hidden_states.clone(),
+                    current_inference_context,
+                    padding_mask,
+                    packed_seq_params,
+                )
+            )
+            return hidden_states * 2
+
+        layer = SimpleNamespace(
+            config=SimpleNamespace(layer_loop_times=3),
+            is_moe_layer=True,
+            mlp=SimpleNamespace(router=router),
+            _forward_attention=forward_attention,
+            _forward_mlp=forward_mlp,
+        )
+
+        initial_hidden_states = torch.tensor(0)
+        initial_context = torch.tensor(100)
+        positional_args = (
+            initial_hidden_states,
+            attention_mask,
+            initial_context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            rotary_pos_cos_sin,
+            attention_bias,
+            inference_context,
+            packed_seq_params,
+            sequence_len_offset,
+            padding_mask,
+        )
+        keyword_args = {
+            "hidden_states": initial_hidden_states,
+            "attention_mask": attention_mask,
+            "context": initial_context,
+            "context_mask": context_mask,
+            "rotary_pos_emb": rotary_pos_emb,
+            "rotary_pos_cos": rotary_pos_cos,
+            "rotary_pos_sin": rotary_pos_sin,
+            "rotary_pos_cos_sin": rotary_pos_cos_sin,
+            "attention_bias": attention_bias,
+            "inference_context": inference_context,
+            "packed_seq_params": packed_seq_params,
+            "sequence_len_offset": sequence_len_offset,
+            "padding_mask": padding_mask,
+        }
+
+        if call_style == "positional":
+            output, context = TransformerLayer.forward(layer, *positional_args)
+        else:
+            output, context = TransformerLayer.forward(layer, **keyword_args)
+
+        assert output.item() == 14
+        assert context.item() == 130
+        assert router.states == [(0, 3), (1, 3), (2, 3)]
+        assert [call["hidden_states"].item() for call in attention_calls] == [0, 2, 6]
+        assert [call["context"].item() for call in attention_calls] == [100, 110, 120]
+        assert [call[0].item() for call in mlp_calls] == [1, 3, 7]
+
+        expected_attention_arguments = {
+            "attention_mask": attention_mask,
+            "context_mask": context_mask,
+            "rotary_pos_emb": rotary_pos_emb,
+            "rotary_pos_cos": rotary_pos_cos,
+            "rotary_pos_sin": rotary_pos_sin,
+            "rotary_pos_cos_sin": rotary_pos_cos_sin,
+            "attention_bias": attention_bias,
+            "inference_context": inference_context,
+            "packed_seq_params": packed_seq_params,
+            "sequence_len_offset": sequence_len_offset,
+            "padding_mask": padding_mask,
+        }
+        for call in attention_calls:
+            for name, expected in expected_attention_arguments.items():
+                assert call[name] is expected
+        for _, current_inference_context, current_padding_mask, current_packed_params in mlp_calls:
+            assert current_inference_context is inference_context
+            assert current_padding_mask is padding_mask
+            assert current_packed_params is packed_seq_params
 
 
 class TestParallelTransformerLayer:

@@ -19,9 +19,7 @@ For PR-label or trigger questions, lead with the exact values:
 - `Run tests`: `scope=mr-github`, `n_repeat=1`, `lightweight=true`.
 - `Run functional tests`: `scope=mr-github`, `n_repeat=5`, `lightweight=false`.
 - `container::lts` only switches the container image path to LTS and combines
-  with any scope label. **Opt-in only — attach it solely when the user
-  explicitly asks for LTS validation; never add it on your own initiative, even
-  for a container or dependency change.**
+  with any scope label.
 - `Run MBridge tests` additionally triggers the MBridge L1 suite.
 - ⚠️ **WARNING — destructive remote write.** `tools/trigger_internal_ci.py`
   **force-pushes the current branch** to the internal GitLab remote as
@@ -76,7 +74,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 | Label | Effect |
 |-------|--------|
-| **`container::lts`** | Build on the older long-term-support NGC PyTorch base instead of `dev`'s latest — a backward-compat check, not a different test set (combinable with any scope label) |
+| **`container::lts`** | Use the LTS base image instead of `dev` (combinable with any scope label) |
 | **`Run MBridge tests`** | Also triggers the MBridge L1 test suite |
 
 ### Which label to attach when opening a PR
@@ -90,7 +88,7 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 | **Re-enabling a disabled test** (scope `-broken` → active) | `Run functional tests` |
 | Non-numerical library code (logging, error handling, CLI flags, refactors) | `Run tests` |
 | Could affect training numerics (model arch, attention, optimizer, distributed, MoE routing) | `Run functional tests` |
-| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` (add `container::lts` **only if the user explicitly asks** to validate LTS) |
+| Container or dependency changes (`docker/`, `pyproject.toml`, `uv.lock`) | `Run tests` + `container::lts` |
 | Touches MBridge integration | add `Run MBridge tests` |
 
 **Rule of thumb:** default to `Run tests`. Always use `Run functional tests` when the PR adds new test cases (golden values must be generated) or when the change could plausibly shift loss curves.

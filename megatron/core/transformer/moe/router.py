@@ -7,8 +7,8 @@ import torch
 
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    is_batch_invariant_mode_enabled,
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
@@ -73,6 +73,17 @@ class Router(ABC, MegatronModule):
         # If calculate per token loss, we need to scale up moe aux loss by the number of tokens.
         # So we need to know if the model is configured to calculate per token loss.
         self.calculate_per_token_loss = self.config.calculate_per_token_loss
+
+        # Loop state is set by GPTModel and TransformerLayer before each repeated pass.
+        self._layer_loop_idx = 0
+        self._layer_loop_times = 1
+        self._model_loop_idx = 0
+        self._model_loop_times = 1
+        self._layer_loop_route_cache = None
+        self._layer_loop_uelb_cache = []
+        self._layer_loop_uelb_route_cache = None
+        self._layer_loop_metric_route_cache = None
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -139,6 +150,39 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
         if getattr(self, "router_replay", None) is not None:
             self.router_replay.layer_number = layer_number
+
+    def set_layer_loop_state(self, loop_idx: int, layer_loop_times: int) -> None:
+        """Set the current layer-loop iteration and reset per-pass caches at loop start."""
+        self._layer_loop_idx = max(0, int(loop_idx))
+        self._layer_loop_times = max(1, int(layer_loop_times))
+        if self._layer_loop_idx == 0:
+            self._layer_loop_route_cache = None
+            self._layer_loop_uelb_cache = []
+            self._layer_loop_uelb_route_cache = None
+            self._layer_loop_metric_route_cache = None
+
+    def set_model_loop_state(self, loop_idx: int, model_loop_times: int) -> None:
+        """Set the current model-loop iteration for loop-specific metric logging."""
+        self._model_loop_idx = max(0, int(loop_idx))
+        self._model_loop_times = max(1, int(model_loop_times))
+
+    def _get_loop_metric_suffix(self) -> str:
+        """Build an unambiguous metric suffix for the current model and layer loops."""
+        suffix_parts = []
+        if self._model_loop_times > 1:
+            suffix_parts.append(f"model_loop_{self._model_loop_idx + 1}")
+        if self._layer_loop_times > 1:
+            suffix_parts.append(f"layer_loop_{self._layer_loop_idx + 1}")
+        return f"_{'_'.join(suffix_parts)}" if suffix_parts else ""
+
+    def _clear_completed_layer_loop_caches(self) -> None:
+        """Release nonpersistent loop caches after the final layer-loop iteration."""
+        if self._layer_loop_idx + 1 < self._layer_loop_times:
+            return
+        self._layer_loop_route_cache = None
+        self._layer_loop_uelb_cache = []
+        self._layer_loop_uelb_route_cache = None
+        self._layer_loop_metric_route_cache = None
 
 
 class TopKRouter(Router):
@@ -402,10 +446,82 @@ class TopKRouter(Router):
 
     def is_aux_loss_enabled(self) -> bool:
         """Check if the auxiliary loss is enabled."""
-        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss"]:
+        for aux_loss_type in ["aux_loss", "seq_aux_loss", "global_aux_loss", "uelb_loss"]:
             if self.get_aux_loss_coeff(aux_loss_type) > 0:
                 return True
         return False
+
+    def _is_uelb_group_end(self) -> bool:
+        """Return whether the current layer-loop iteration closes a UELB group."""
+        group_size = max(1, int(self.config.moe_uelb_group_size))
+        next_loop_idx = self._layer_loop_idx + 1
+        return (next_loop_idx % group_size == 0) or (next_loop_idx == self._layer_loop_times)
+
+    def _apply_uelb_loss(
+        self,
+        probs: torch.Tensor,
+        scores_for_aux_loss: torch.Tensor,
+        routing_map: torch.Tensor,
+        with_padding_mask: bool = False,
+    ):
+        """Apply load balancing across a group of consecutive layer-loop iterations."""
+        uelb_loss_coeff = self.get_aux_loss_coeff("uelb_loss")
+        if uelb_loss_coeff == 0:
+            return probs
+
+        if self.config.layer_loop_reuse_expert and self._layer_loop_idx == 0:
+            self._layer_loop_uelb_route_cache = (
+                scores_for_aux_loss,
+                routing_map,
+                with_padding_mask,
+            )
+
+        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+            get_tokens_per_expert_and_token_count(
+                routing_map=routing_map,
+                reduce_group=self.tp_cp_group,
+                topk=self.topk,
+                with_padding_mask=with_padding_mask,
+            )
+        )
+        self._layer_loop_uelb_cache.append(
+            (
+                scores_for_aux_loss,
+                global_tokens_per_expert,
+                local_num_tokens,
+                total_num_tokens,
+            )
+        )
+
+        if not self._is_uelb_group_end():
+            return probs
+
+        grouped_scores = torch.cat([item[0] for item in self._layer_loop_uelb_cache], dim=0)
+        grouped_tokens_per_expert = torch.stack(
+            [item[1] for item in self._layer_loop_uelb_cache], dim=0
+        ).sum(dim=0)
+        grouped_local_num_tokens = sum(item[2] for item in self._layer_loop_uelb_cache)
+        grouped_total_num_tokens = sum(item[3] for item in self._layer_loop_uelb_cache)
+
+        uelb_loss = switch_load_balancing_loss_func(
+            probs=grouped_scores,
+            tokens_per_expert=grouped_tokens_per_expert,
+            total_num_tokens=grouped_total_num_tokens,
+            topk=self.topk,
+            num_experts=self.config.num_moe_experts,
+            moe_aux_loss_coeff=uelb_loss_coeff,
+            fused=self.config.moe_router_fusion,
+        )
+        self._layer_loop_uelb_cache = []
+
+        return self.attach_and_log_load_balancing_loss(
+            probs,
+            uelb_loss_coeff,
+            uelb_loss,
+            "uelb_load_balancing_loss",
+            self.tp_cp_group,
+            valid_token_count=grouped_local_num_tokens,
+        )
 
     def _apply_aux_loss(
         self,
@@ -639,15 +755,108 @@ class TopKRouter(Router):
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
 
+    def _get_logging_layer_metadata(self):
+        """Return the logical layer number and tracker size for MoE metrics."""
+        num_layers = self.config.num_layers
+        if self.config.mtp_num_layers is not None:
+            num_layers += self.config.mtp_num_layers
+
+        if self.is_mtp_layer:
+            layer_number = self.layer_number + self.config.num_layers
+        else:
+            layer_number = self.layer_number
+        return layer_number, num_layers
+
+    def _save_router_metric(self, name: str, value: torch.Tensor) -> None:
+        """Save an already TP/CP-reduced router metric in the MoE tracker."""
+        layer_number, num_layers = self._get_logging_layer_metadata()
+        if layer_number is None:
+            return
+
+        metric = value.detach().float()
+        if self.tp_cp_group is not None and self.tp_cp_group.size() > 1:
+            # Every TP/CP rank holds the reduced value. Pre-dividing compensates for the
+            # tracker's later sum-reduction over the same group.
+            metric = metric / self.tp_cp_group.size()
+
+        get_moe_metrics_tracker().record(
+            name,
+            metric,
+            layer_number,
+            num_layers,
+            reduce_group=self.tp_cp_group,
+        )
+
+    def _log_router_balance_metrics(
+        self,
+        routing_map_before_drop: torch.Tensor,
+        routing_map_after_drop: torch.Tensor,
+        padding_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Collect expert utilization, token drop, and load-violation metrics."""
+        if self.layer_number is None:
+            return
+
+        with torch.no_grad():
+            pre_map = routing_map_before_drop
+            post_map = routing_map_after_drop
+            if padding_mask is not None:
+                valid_mask = (~padding_mask).unsqueeze(-1)
+                pre_map = pre_map & valid_mask
+                post_map = post_map & valid_mask
+
+            pre_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                pre_map.sum(dim=0).float(), self.tp_cp_group
+            )
+            post_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+                post_map.sum(dim=0).float(), self.tp_cp_group
+            )
+
+            num_experts = float(self.config.num_moe_experts)
+            pre_total = pre_tokens_per_expert.sum()
+            post_total = post_tokens_per_expert.sum()
+
+            expert_ratio = (post_tokens_per_expert > 0).float().sum() / num_experts
+            zero = post_total.new_zeros(())
+            drop_ratio = torch.where(
+                pre_total > 0,
+                (pre_total - post_total).clamp_min(0.0) / pre_total.clamp_min(1.0),
+                zero,
+            )
+
+            average_load = post_total / num_experts
+            relative_violation = (post_tokens_per_expert - average_load).abs() / average_load.clamp_min(
+                torch.finfo(post_tokens_per_expert.dtype).eps
+            )
+            maxvio = torch.where(post_total > 0, relative_violation.max(), zero)
+            avgvio = torch.where(post_total > 0, relative_violation.mean(), zero)
+
+            if self._layer_loop_idx == 0:
+                self._save_router_metric("expert_ratio", expert_ratio)
+                self._save_router_metric("drop_ratio", drop_ratio)
+                self._save_router_metric("maxvio", maxvio)
+                self._save_router_metric("avgvio", avgvio)
+
+            loop_suffix = self._get_loop_metric_suffix()
+            if loop_suffix:
+                self._save_router_metric(f"expert_ratio{loop_suffix}", expert_ratio)
+                self._save_router_metric(f"drop_ratio{loop_suffix}", drop_ratio)
+                self._save_router_metric(f"maxvio{loop_suffix}", maxvio)
+                self._save_router_metric(f"avgvio{loop_suffix}", avgvio)
+
+    def _should_log_balance_metrics(self) -> bool:
+        """Return whether balance metrics should be collected for this forward pass."""
+        return self.training or self.config.moe_balance_metrics_in_eval
+
     def apply_z_loss(self, logits, padding_mask: Optional[torch.Tensor] = None):
         """Encourages the router's logits to remain small to enhance stability.
         Please refer to the ST-MoE paper (https://arxiv.org/pdf/2202.08906.pdf) for details.
 
         Args:
             logits (torch.Tensor): The logits of the router.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape in [num_tokens]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding tokens.
+                                                   Shape [num_tokens]. True for padding tokens,
+                                                   False for valid tokens. Defaults to None.
 
         Returns:
             torch.Tensor: The logits after applying the z-loss.
@@ -738,7 +947,7 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask.reshape(-1)).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def routing(self, logits: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -746,9 +955,9 @@ class TopKRouter(Router):
 
         Args:
             logits (torch.Tensor): Logits tensor after gating.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding tokens.
+                                                   Shape [seq_length, bsz]. True for padding tokens,
+                                                   False for valid tokens. Defaults to None.
 
         Returns:
             probs (torch.Tensor): The probabilities of token to experts assignment.
@@ -789,6 +998,7 @@ class TopKRouter(Router):
 
         # Apply token dropping to probs and routing_map.
         if self.config.moe_expert_capacity_factor is not None:
+            routing_map_before_drop = routing_map
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
@@ -797,6 +1007,8 @@ class TopKRouter(Router):
                 drop_policy=self.config.moe_token_drop_policy,
                 pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
             )
+        else:
+            routing_map_before_drop = routing_map
 
         # Apply each aux loss type and attach aux loss autograd function to probs
         if self.training and torch.is_grad_enabled() and self.is_aux_loss_enabled():
@@ -828,6 +1040,24 @@ class TopKRouter(Router):
                 routing_map_for_aux_loss,
                 with_padding_mask=padding_mask is not None,
             )
+            probs = self._apply_uelb_loss(
+                probs,
+                scores_for_aux_loss,
+                routing_map_for_aux_loss,
+                with_padding_mask=padding_mask is not None,
+            )
+
+        if self._should_log_balance_metrics():
+            self._log_router_balance_metrics(
+                routing_map_before_drop,
+                routing_map,
+                padding_mask=padding_mask,
+            )
+            if self.config.layer_loop_reuse_expert and self._layer_loop_idx == 0:
+                self._layer_loop_metric_route_cache = (
+                    routing_map_before_drop,
+                    routing_map,
+                )
 
         # Optionally apply expert bias
         self._apply_expert_bias(routing_map, padding_mask=padding_mask)
@@ -846,11 +1076,42 @@ class TopKRouter(Router):
 
         Args:
             input (torch.Tensor): Input tensor.
-            padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
-                                                   Shape [seq_length, bsz]. True for valid tokens,
-                                                   False for padding tokens. Defaults to None.
+            padding_mask (torch.Tensor, optional): Boolean mask indicating padding tokens.
+                                                   Shape [seq_length, bsz]. True for padding tokens,
+                                                   False for valid tokens. Defaults to None.
         """
         self._maintain_float32_expert_bias()
+
+        reuse_expert = (
+            self.config.layer_loop_reuse_expert
+            and self._layer_loop_times > 1
+            and self._layer_loop_idx > 0
+        )
+        if reuse_expert and self._layer_loop_route_cache is not None:
+            probs, routing_map = self._layer_loop_route_cache
+            if self._layer_loop_uelb_route_cache is not None:
+                scores_for_aux_loss, routing_map_for_aux_loss, with_padding_mask = (
+                    self._layer_loop_uelb_route_cache
+                )
+                probs = self._apply_uelb_loss(
+                    probs,
+                    scores_for_aux_loss,
+                    routing_map_for_aux_loss,
+                    with_padding_mask=with_padding_mask,
+                )
+            if self._should_log_balance_metrics() and self._layer_loop_metric_route_cache is not None:
+                routing_map_before_drop, routing_map_after_drop = (
+                    self._layer_loop_metric_route_cache
+                )
+                flat_padding_mask = padding_mask.reshape(-1) if padding_mask is not None else None
+                self._log_router_balance_metrics(
+                    routing_map_before_drop,
+                    routing_map_after_drop,
+                    padding_mask=flat_padding_mask,
+                )
+            self._apply_expert_bias(routing_map, padding_mask=padding_mask)
+            self._clear_completed_layer_loop_caches()
+            return probs, routing_map
 
         # Apply input jitter
         input = self.apply_input_jitter(input)
@@ -868,6 +1129,10 @@ class TopKRouter(Router):
 
         probs, routing_map = self.routing(logits, padding_mask=padding_mask)
 
+        if self.config.layer_loop_reuse_expert and self._layer_loop_idx == 0:
+            self._layer_loop_route_cache = (probs, routing_map)
+
+        self._clear_completed_layer_loop_caches()
         return probs, routing_map
 
     def _load_from_state_dict(self, *args, **kwargs):
@@ -956,12 +1221,7 @@ class InferenceTopKRouter(TopKRouter):
         if self.qb_beta is not None:
             precomputed_indices = (logits - self.qb_beta).topk(self.topk, dim=1).indices
 
-        routing = (
-            topk_routing_with_score_function
-            if is_batch_invariant_mode_enabled()
-            else self._compiled_topk_routing
-        )
-        probs, top_indices = routing(
+        probs, top_indices = self._compiled_topk_routing(
             logits,
             self.topk,
             use_pre_softmax=self.config.moe_router_pre_softmax,
@@ -993,4 +1253,36 @@ class InferenceTopKRouter(TopKRouter):
         if not InferenceMode.is_active():
             return super().forward(input, padding_mask)
 
-        return self._forward(input, padding_mask)
+        reuse_expert = (
+            self.config.layer_loop_reuse_expert
+            and self._layer_loop_times > 1
+            and self._layer_loop_idx > 0
+        )
+        if reuse_expert and self._layer_loop_route_cache is not None:
+            probs, top_indices = self._layer_loop_route_cache
+            if self._should_log_balance_metrics():
+                flat_indices = top_indices.reshape(-1, self.topk)
+                routing_map = torch.zeros(
+                    (flat_indices.shape[0], self.config.num_moe_experts),
+                    dtype=torch.bool,
+                    device=flat_indices.device,
+                ).scatter_(1, flat_indices, True)
+                self._log_router_balance_metrics(routing_map, routing_map)
+            self._clear_completed_layer_loop_caches()
+            return probs, top_indices
+
+        probs, top_indices = self._forward(input, padding_mask)
+        if self.config.layer_loop_reuse_expert and self._layer_loop_idx == 0:
+            self._layer_loop_route_cache = (probs, top_indices)
+
+        if self._should_log_balance_metrics():
+            flat_indices = top_indices.reshape(-1, self.topk)
+            routing_map = torch.zeros(
+                (flat_indices.shape[0], self.config.num_moe_experts),
+                dtype=torch.bool,
+                device=flat_indices.device,
+            ).scatter_(1, flat_indices, True)
+            self._log_router_balance_metrics(routing_map, routing_map)
+
+        self._clear_completed_layer_loop_caches()
+        return probs, top_indices

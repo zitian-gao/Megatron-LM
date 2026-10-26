@@ -212,17 +212,15 @@ class BridgeCommunicator:
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction.
 
-        We elect a leader for each DP and GTP data lane, the first tp-cp rank in the group
+        We elect leader rank for each dp replica, the first tp-cp rank in the group
         in the last pp stage (for src grid) or first pp stage (for dest grid) is the leader.
         """
         leader_ranks = []
         local_leader_rank = None
-        # grid.gen_rank_enum(["tp", "cp", "pp"]) # vary tp & cp, same dp and gtp_remat
+        # grid.gen_rank_enum(["tp", "cp", "pp"]) # vary tp & cp, but same dp
         # returns a list of sublists, each sublist is a group of ranks
-        # that have different tp & cp & pp, same dp and gtp_remat
-        per_dp_replica_ranks = grid._gen_rank_enum(
-            [x for x in grid.dim_names if x not in ("dp", "gtp_remat")]
-        )
+        # that have different tp & cp & pp, same dp
+        per_dp_replica_ranks = grid._gen_rank_enum([x for x in grid.dim_names if x != "dp"])
         if is_src:
             # Add rank from last pp stage
             ranks = []

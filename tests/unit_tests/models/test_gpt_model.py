@@ -1,9 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
-import logging
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -29,8 +29,215 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class TestGPTModelLooping:
+
+    def test_model_loop_chains_decoder_hidden_states_and_router_state(self):
+        """Pre/post-processing happens once around a chained sequence of decoder calls."""
+
+        class RecordingRouter:
+            def __init__(self):
+                self.states = []
+
+            def set_model_loop_state(self, loop_idx, model_loop_times):
+                self.states.append((loop_idx, model_loop_times))
+
+        class RecordingDecoder:
+            def __init__(self, layer):
+                self.layers = [layer]
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs.copy())
+                return kwargs["hidden_states"] + 1
+
+        router = RecordingRouter()
+        layer = SimpleNamespace(is_moe_layer=True, mlp=SimpleNamespace(router=router))
+        decoder = RecordingDecoder(layer)
+        preprocess_calls = []
+        postprocess_calls = []
+
+        rotary_pos_emb = object()
+        rotary_pos_cos = object()
+        rotary_pos_sin = object()
+        rotary_pos_cos_sin = object()
+        sequence_len_offset = object()
+        padding_mask = object()
+
+        def preprocess(**kwargs):
+            preprocess_calls.append(kwargs.copy())
+            return (
+                kwargs["decoder_input"],
+                rotary_pos_emb,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                sequence_len_offset,
+                padding_mask,
+                rotary_pos_cos_sin,
+            )
+
+        def postprocess(**kwargs):
+            postprocess_calls.append(kwargs.copy())
+            return kwargs["hidden_states"]
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                fine_grained_activation_offloading=False,
+                moe_paged_stash=False,
+                model_loop_times=3,
+            ),
+            decoder=decoder,
+            mtp_process=False,
+            _preprocess=preprocess,
+            _postprocess=postprocess,
+        )
+
+        input_ids = object()
+        position_ids = object()
+        attention_mask = object()
+        inference_context = object()
+        packed_seq_params = object()
+        block_option = object()
+        extra_block_kwargs = {"block_option": block_option}
+
+        output = GPTModel.forward(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=torch.tensor(0),
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            padding_mask=padding_mask,
+        )
+
+        assert output.item() == 3
+        assert len(preprocess_calls) == 1
+        assert len(postprocess_calls) == 1
+        assert [call["hidden_states"].item() for call in decoder.calls] == [0, 1, 2]
+        assert router.states == [(0, 3), (1, 3), (2, 3)]
+
+        expected_decoder_arguments = {
+            "attention_mask": attention_mask,
+            "inference_context": inference_context,
+            "rotary_pos_emb": rotary_pos_emb,
+            "rotary_pos_cos": rotary_pos_cos,
+            "rotary_pos_sin": rotary_pos_sin,
+            "rotary_pos_cos_sin": rotary_pos_cos_sin,
+            "packed_seq_params": packed_seq_params,
+            "sequence_len_offset": sequence_len_offset,
+            "padding_mask": padding_mask,
+            "block_option": block_option,
+        }
+        for call in decoder.calls:
+            for name, expected in expected_decoder_arguments.items():
+                assert call[name] is expected
+
+        assert preprocess_calls[0]["padding_mask"] is padding_mask
+        assert postprocess_calls[0]["hidden_states"].item() == 3
+        assert postprocess_calls[0]["decoder_input"].item() == 0
+        assert postprocess_calls[0]["extra_block_kwargs"] is extra_block_kwargs
+        assert postprocess_calls[0]["inference_context"] is inference_context
+
+    def test_combined_layer_and_model_loops_form_cartesian_state_sequence(self):
+        """M model loops each execute all L layer loops with the expected router state."""
+
+        class RecordingRouter:
+            def __init__(self):
+                self.model_loop_idx = None
+                self.layer_loop_idx = None
+                self.model_states = []
+                self.layer_states = []
+
+            def set_model_loop_state(self, loop_idx, model_loop_times):
+                self.model_loop_idx = loop_idx
+                self.model_states.append((loop_idx, model_loop_times))
+
+            def set_layer_loop_state(self, loop_idx, layer_loop_times):
+                self.layer_loop_idx = loop_idx
+                self.layer_states.append((loop_idx, layer_loop_times))
+
+        router = RecordingRouter()
+        computation_states = []
+
+        def forward_attention(*args, **kwargs):
+            hidden_states = kwargs["hidden_states"] if kwargs else args[0]
+            context = kwargs.get("context") if kwargs else args[2]
+            computation_states.append((router.model_loop_idx, router.layer_loop_idx))
+            return hidden_states + 1, context
+
+        def forward_mlp(
+            hidden_states, inference_context, *, padding_mask, packed_seq_params
+        ):
+            return hidden_states + 1
+
+        layer = SimpleNamespace(
+            config=SimpleNamespace(layer_loop_times=2),
+            is_moe_layer=True,
+            mlp=SimpleNamespace(router=router),
+            _forward_attention=forward_attention,
+            _forward_mlp=forward_mlp,
+        )
+
+        class LayerBackedDecoder:
+            def __init__(self):
+                self.layers = [layer]
+                self.calls = 0
+
+            def __call__(self, **kwargs):
+                self.calls += 1
+                hidden_states, _ = TransformerLayer.forward(layer, **kwargs)
+                return hidden_states
+
+        decoder = LayerBackedDecoder()
+        postprocess_calls = []
+
+        def preprocess(**kwargs):
+            return (kwargs["decoder_input"], None, None, None, None, kwargs["padding_mask"])
+
+        def postprocess(**kwargs):
+            postprocess_calls.append(kwargs.copy())
+            return kwargs["hidden_states"]
+
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                fine_grained_activation_offloading=False,
+                moe_paged_stash=False,
+                model_loop_times=3,
+            ),
+            decoder=decoder,
+            mtp_process=False,
+            _preprocess=preprocess,
+            _postprocess=postprocess,
+        )
+
+        output = GPTModel.forward(
+            model,
+            input_ids=object(),
+            position_ids=object(),
+            attention_mask=object(),
+            decoder_input=torch.tensor(0),
+        )
+
+        assert output.item() == 12
+        assert decoder.calls == 3
+        assert router.model_states == [(0, 3), (1, 3), (2, 3)]
+        assert router.layer_states == [(0, 2), (1, 2)] * 3
+        assert computation_states == [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+        ]
+        assert len(postprocess_calls) == 1
+        assert postprocess_calls[0]["hidden_states"].item() == 12
 
 
 class TestGPTModel:
@@ -48,29 +255,18 @@ class TestGPTModel:
             use_cpu_initialization=True,
             embedding_init_method_std=1.0,  # Test that we can initialize the embedding weights to something else.
         )
-        with patch('megatron.core.models.gpt.gpt_model.log_single_rank') as mock_log_single_rank:
-            self.gpt_model = GPTModel(
-                config=transformer_config,
-                transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
-                vocab_size=100,
-                max_sequence_length=4,
-            )
-        self.mock_log_single_rank = mock_log_single_rank
+        self.gpt_model = GPTModel(
+            config=transformer_config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=100,
+            max_sequence_length=4,
+        )
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     def test_constructor(self):
-        self.mock_log_single_rank.assert_called_once()
-        _, level, message = self.mock_log_single_rank.call_args.args
-        assert level == logging.WARNING
-        assert message == (
-            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
-            "features. Please reference the migration guide "
-            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`"
-        )
-
         assert isinstance(self.gpt_model, GPTModel)
 
         assert self.gpt_model.max_sequence_length == 4

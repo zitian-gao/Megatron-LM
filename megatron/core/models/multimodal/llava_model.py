@@ -1270,7 +1270,6 @@ class LLaVAModel(MegatronModule):
             attention_mask=attention_mask,
             decoder_input=combined_embeddings,
             labels=new_labels,
-            loss_mask=new_loss_mask,
             inference_context=inference_context,
             runtime_gather_output=runtime_gather_output,
             packed_seq_params=packed_seq_params,

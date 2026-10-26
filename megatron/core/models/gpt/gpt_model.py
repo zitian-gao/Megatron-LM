@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import logging
 from collections import OrderedDict
 from typing import Any, Callable, Dict, Literal, Optional
 
@@ -42,10 +41,7 @@ from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
     is_using_quantization_scales,
-    log_single_rank,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class GPTModel(LanguageModule):
@@ -115,13 +111,6 @@ class GPTModel(LanguageModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "GPTModel IS DEPRECATED. GPTModel is only accepting critical bug fixes, no new "
-            "features. Please reference the migration guide "
-            "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
-        )
         super().__init__(config=config, pg_collection=pg_collection)
 
         if has_config_logger_enabled(config):
@@ -579,20 +568,32 @@ class GPTModel(LanguageModule):
 
         rotary_pos_cos_sin = preproc_output[6] if len(preproc_output) == 7 else None
 
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            rotary_pos_cos=rotary_pos_cos,
-            rotary_pos_sin=rotary_pos_sin,
-            rotary_pos_cos_sin=rotary_pos_cos_sin,
-            packed_seq_params=packed_seq_params,
-            sequence_len_offset=sequence_len_offset,
-            padding_mask=padding_mask,
-            **(extra_block_kwargs or {}),
-        )
+        model_loop_times = max(1, getattr(self.config, "model_loop_times", 1))
+
+        def set_decoder_model_loop_state(loop_idx: int) -> None:
+            for layer in self.decoder.layers:
+                router = getattr(getattr(layer, "mlp", None), "router", None)
+                if getattr(layer, "is_moe_layer", False) and hasattr(
+                    router, "set_model_loop_state"
+                ):
+                    router.set_model_loop_state(loop_idx, model_loop_times)
+
+        hidden_states = decoder_input
+        for model_loop_idx in range(model_loop_times):
+            set_decoder_model_loop_state(model_loop_idx)
+            hidden_states = self.decoder(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                **(extra_block_kwargs or {}),
+            )
 
         return self._postprocess(
             hidden_states=hidden_states,

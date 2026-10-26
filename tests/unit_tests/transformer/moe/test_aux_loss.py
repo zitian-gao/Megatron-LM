@@ -6,11 +6,14 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+)
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
 )
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
@@ -597,6 +600,125 @@ class TestRouterAuxLoss:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_uelb_loss_matches_grouped_aux_loss(self):
+        """A complete UELB group is equivalent to routing the concatenated tokens once."""
+        model_parallel_cuda_manual_seed(42)
+        tracker = get_moe_metrics_tracker()
+        tracker.clear()
+
+        uelb_router = self.new_router(
+            moe_router_load_balancing_type="uelb_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            layer_loop_times=2,
+            moe_uelb_group_size=2,
+        ).cuda()
+        reference_router = self.new_router(
+            moe_router_load_balancing_type="aux_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+        ).cuda()
+        with torch.no_grad():
+            reference_router.weight.copy_(uelb_router.weight)
+
+        hidden_states = [
+            torch.randn((16, 2, uelb_router.config.hidden_size), device="cuda").bfloat16()
+            for _ in range(2)
+        ]
+
+        uelb_router.weight.grad = None
+        uelb_router.set_layer_loop_state(0, 2)
+        uelb_router(hidden_states[0])
+        entry = tracker.metrics.get("uelb_load_balancing_loss")
+        assert entry is None or entry.values.count_nonzero().item() == 0
+
+        uelb_router.set_layer_loop_state(1, 2)
+        uelb_scores, _ = uelb_router(hidden_states[1])
+        uelb_scores.backward(torch.zeros_like(uelb_scores))
+        uelb_grad = uelb_router.weight.grad.clone()
+        # MoEMetricsTracker.clear() zeros entries in place, so preserve the value
+        # before running the reference pass.
+        uelb_loss = tracker.metrics["uelb_load_balancing_loss"].values[0].clone()
+        reduce_from_tensor_model_parallel_region(uelb_loss, uelb_router.tp_cp_group)
+
+        tracker.clear()
+        reference_router.weight.grad = None
+        reference_scores, _ = reference_router(torch.cat(hidden_states, dim=0))
+        reference_scores.backward(torch.zeros_like(reference_scores))
+        reference_grad = reference_router.weight.grad.clone()
+        reference_loss = tracker.metrics["load_balancing_loss"].values[0].clone()
+        reduce_from_tensor_model_parallel_region(reference_loss, reference_router.tp_cp_group)
+
+        torch.testing.assert_close(uelb_loss, reference_loss)
+        torch.testing.assert_close(uelb_grad, reference_grad)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_uelb_loss_is_recorded_only_at_group_end(self):
+        tracker = get_moe_metrics_tracker()
+        tracker.clear()
+        router = self.new_router(
+            moe_router_load_balancing_type="uelb_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            layer_loop_times=2,
+            layer_loop_reuse_expert=True,
+            moe_uelb_group_size=2,
+        ).cuda()
+        hidden_states = [
+            torch.randn((8, 2, router.config.hidden_size), device="cuda").bfloat16()
+            for _ in range(2)
+        ]
+
+        router.set_layer_loop_state(0, 2)
+        _, first_routing_map = router(hidden_states[0])
+        entry = tracker.metrics.get("uelb_load_balancing_loss")
+        assert entry is None or entry.values.count_nonzero().item() == 0
+        assert len(router._layer_loop_uelb_cache) == 1
+
+        router.set_layer_loop_state(1, 2)
+        _, reused_routing_map = router(hidden_states[1])
+        assert reused_routing_map is first_routing_map
+        assert tracker.metrics["uelb_load_balancing_loss"].values[0] > 0
+        assert router._layer_loop_uelb_cache == []
+        assert router._layer_loop_route_cache is None
+        assert router._layer_loop_uelb_route_cache is None
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_uelb_loss_flushes_partial_group_at_final_loop(self):
+        """The last loop closes a non-full UELB group instead of dropping it."""
+        tracker = get_moe_metrics_tracker()
+        tracker.clear()
+        router = self.new_router(
+            moe_router_load_balancing_type="uelb_loss",
+            moe_aux_loss_coeff=1.0,
+            moe_router_dtype="fp64",
+            layer_loop_times=3,
+            moe_uelb_group_size=2,
+        ).cuda()
+        hidden_states = [
+            torch.randn((8, 2, router.config.hidden_size), device="cuda").bfloat16()
+            for _ in range(3)
+        ]
+
+        router.set_layer_loop_state(0, 3)
+        router(hidden_states[0])
+        assert len(router._layer_loop_uelb_cache) == 1
+
+        router.set_layer_loop_state(1, 3)
+        router(hidden_states[1])
+        assert tracker.metrics["uelb_load_balancing_loss"].values[0] > 0
+        assert router._layer_loop_uelb_cache == []
+
+        tracker.clear()
+        router.set_layer_loop_state(2, 3)
+        router(hidden_states[2])
+        assert tracker.metrics["uelb_load_balancing_loss"].values[0] > 0
+        assert router._layer_loop_uelb_cache == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize(
         "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
     )
@@ -719,7 +841,9 @@ class TestRouterAuxLoss:
         packed_seq_params with the flattened input produces the same
         seq_load_balancing_loss as the un-flattened input.
         """
-        from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_local_submodules,
+        )
         from megatron.core.packed_seq_params import PackedSeqParams
         from megatron.core.transformer.transformer_layer import TransformerLayer
 
